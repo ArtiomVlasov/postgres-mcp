@@ -218,6 +218,39 @@ The Postgres MCP Pro Docker image will automatically remap the hostname `localho
 Replace `postgresql://...` with your [Postgres database connection URI](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS).
 
 
+##### Multiple Databases
+
+One server instance can work with any number of databases. Every tool takes an optional `database` argument; the database for a call is picked in this order:
+
+1. the `database` argument: an alias (see below) or a full connection URI,
+2. the `X-Database-URI` HTTP header (SSE and streamable HTTP transports only), which also accepts an alias or a URI,
+3. the default database from `DATABASE_URI` or the command-line argument.
+
+The default database is optional: without it, every call must name a database.
+
+Register named databases (aliases) so the model can switch between them without ever seeing passwords:
+
+```bash
+postgres-mcp postgresql://user:pass@localhost/main \
+  --database analytics=postgresql://user:pass@analytics-host/analytics \
+  --database billing=postgresql://user:pass@billing-host/billing
+```
+
+Aliases can also come from environment variables named `DATABASE_URI_<ALIAS>`, for example `DATABASE_URI_ANALYTICS=postgresql://...`. The `list_databases` tool shows the configured aliases (host, port and database name only, no credentials).
+
+Connection pools are created on first use and cached per database. Related options:
+
+| Option | Environment variable | Default | Meaning |
+|--------|----------------------|---------|---------|
+| `--database ALIAS=URI` | `DATABASE_URI_<ALIAS>` | none | Register a named database. Repeatable. |
+| `--allowed-hosts h1,h2` | `POSTGRES_MCP_ALLOWED_HOSTS` | any host | Hosts that connection URIs from tool calls or headers may point to. Aliases and the default database are always allowed. |
+| `--no-dynamic-uri` | `POSTGRES_MCP_NO_DYNAMIC_URI=1` | off | Accept only aliases and the default database, never raw connection URIs. |
+| `--max-pools N` | `POSTGRES_MCP_MAX_POOLS` | 10 | Maximum cached pools; the least recently used one is closed first. The default database's pool is never closed. |
+| `--pool-idle-ttl SECONDS` | `POSTGRES_MCP_POOL_IDLE_TTL` | 600 | Close pools unused for this long (`0` disables). |
+
+A connection URI passed in the `database` argument goes through the model's context, so it ends up in the conversation history. Prefer aliases, or the `X-Database-URI` header on HTTP transports. When the server is reachable over the network, set `--allowed-hosts` or `--no-dynamic-uri` so it cannot be pointed at arbitrary hosts.
+
+
 ##### Access Mode
 
 Postgres MCP Pro supports multiple *access modes* to give you control over the operations that the AI agent can perform on the database:
@@ -340,6 +373,7 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
+| `list_databases` | Lists the databases the server is configured for (aliases usable as the `database` argument of the other tools), without credentials. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |
@@ -349,6 +383,8 @@ Postgres MCP Pro Tools:
 | `analyze_workload_indexes` | Analyzes the database workload to identify resource-intensive queries, then recommends optimal indexes for them. |
 | `analyze_query_indexes` | Analyzes a list of specific SQL queries (up to 10) and recommends optimal indexes for them. |
 | `analyze_db_health` | Performs comprehensive health checks including: buffer cache hit rates, connection health, constraint validation, index health (duplicate/unused/invalid), sequence limits, and vacuum health. |
+
+All tools except `list_databases` accept an optional `database` argument (an alias or a connection URI); see [Multiple Databases](#multiple-databases).
 
 
 ## Related Projects

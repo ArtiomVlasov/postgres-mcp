@@ -27,11 +27,13 @@ from .explain import ExplainPlanTool
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
-from .sql import DbConnPool
+from .sql import DatabaseRegistry
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
+from .sql.db_registry import DEFAULT_IDLE_TTL_SECONDS
+from .sql.db_registry import DEFAULT_MAX_POOLS
 from .top_queries import TopQueriesCalc
 
 # Initialize FastMCP with default settings
@@ -40,6 +42,12 @@ mcp = FastMCP("postgres-mcp")
 # Constants
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
+DATABASE_URI_HEADER = "x-database-uri"
+ALIAS_ENV_PREFIX = "DATABASE_URI_"
+
+DATABASE_PARAM_DESCRIPTION = (
+    "Optional. Database to run against: an alias from list_databases, or a postgresql:// connection URI. Omit to use the server's default database."
+)
 
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
@@ -54,14 +62,34 @@ class AccessMode(str, Enum):
 
 
 # Global variables
-db_connection = DbConnPool()
+db_registry = DatabaseRegistry()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 
 
-async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
-    """Get the appropriate SQL driver based on the current access mode."""
-    base_driver = SqlDriver(conn=db_connection)
+def _database_from_request_headers() -> str | None:
+    """Value of the X-Database-URI header for HTTP transports, None for stdio or outside a request."""
+    try:
+        request = mcp.get_context().request_context.request
+    except (LookupError, ValueError):
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    return headers.get(DATABASE_URI_HEADER)
+
+
+async def get_sql_driver(database: str | None = None) -> Union[SqlDriver, SafeSqlDriver]:
+    """Get the SQL driver for the requested database, based on the current access mode.
+
+    ``database`` is an alias or connection URI; when omitted, the X-Database-URI header
+    and then the server's default database are used.
+    """
+    if not isinstance(database, str):  # tools called directly may pass pydantic FieldInfo defaults
+        database = None
+    uri = db_registry.resolve(database, _database_from_request_headers())
+    conn = await db_registry.get_pool(uri)
+    base_driver = SqlDriver(conn=conn)
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
@@ -82,16 +110,31 @@ def format_error_response(error: str) -> ResponseType:
 
 
 @mcp.tool(
+    description="List the databases this server can work with (aliases usable as the 'database' argument of other tools) "
+    "and whether arbitrary connection URIs are accepted.",
+    annotations=ToolAnnotations(
+        title="List Databases",
+        readOnlyHint=True,
+    ),
+)
+async def list_databases() -> ResponseType:
+    """List configured databases without exposing credentials."""
+    return format_text_response(db_registry.describe())
+
+
+@mcp.tool(
     description="List all schemas in the database",
     annotations=ToolAnnotations(
         title="List Schemas",
         readOnlyHint=True,
     ),
 )
-async def list_schemas() -> ResponseType:
+async def list_schemas(
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
+) -> ResponseType:
     """List all schemas in the database."""
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         rows = await sql_driver.execute_query(
             """
             SELECT
@@ -123,10 +166,11 @@ async def list_schemas() -> ResponseType:
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
 
         if object_type in ("table", "view"):
             table_type = "BASE TABLE" if object_type == "table" else "VIEW"
@@ -198,10 +242,11 @@ async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """Get detailed information about a database object."""
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
 
         if object_type in ("table", "view"):
             # Get columns
@@ -353,6 +398,7 @@ Examples: [
 If there is no hypothetical index, you can pass an empty list.""",
         default=[],
     ),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """
     Explains the execution plan for a SQL query.
@@ -363,7 +409,7 @@ If there is no hypothetical index, you can pass an empty list.""",
         hypothetical_indexes: Optional list of indexes to simulate
     """
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         explain_tool = ExplainPlanTool(sql_driver=sql_driver)
         result: ExplainPlanArtifact | ErrorResult | None = None
 
@@ -414,10 +460,11 @@ If there is no hypothetical index, you can pass an empty list.""",
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         rows = await sql_driver.execute_query(sql)  # type: ignore
         if rows is None:
             return format_text_response("No results")
@@ -438,10 +485,11 @@ async def execute_sql(
 async def analyze_workload_indexes(
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """Analyze frequently executed queries in the database and recommend optimal indexes."""
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         if method == "dta":
             index_tuning = DatabaseTuningAdvisor(sql_driver)
         else:
@@ -466,6 +514,7 @@ async def analyze_query_indexes(
     queries: list[str] = Field(description="List of Query strings to analyze"),
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """Analyze a list of SQL queries and recommend optimal indexes."""
     if len(queries) == 0:
@@ -474,7 +523,7 @@ async def analyze_query_indexes(
         return format_error_response(f"Please provide a list of up to {MAX_NUM_INDEX_TUNING_QUERIES} queries to analyze.")
 
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         if method == "dta":
             index_tuning = DatabaseTuningAdvisor(sql_driver)
         else:
@@ -508,6 +557,7 @@ async def analyze_db_health(
         description=f"Optional. Valid values are: {', '.join(sorted([t.value for t in HealthType]))}.",
         default="all",
     ),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     """Analyze database health for specified components.
 
@@ -515,9 +565,13 @@ async def analyze_db_health(
         health_type: Comma-separated list of health check types to perform.
                     Valid values: index, connection, vacuum, sequence, replication, buffer, constraint, all
     """
-    health_tool = DatabaseHealthTool(await get_sql_driver())
-    result = await health_tool.health(health_type=health_type)
-    return format_text_response(result)
+    try:
+        health_tool = DatabaseHealthTool(await get_sql_driver(database))
+        result = await health_tool.health(health_type=health_type)
+        return format_text_response(result)
+    except Exception as e:
+        logger.error(f"Error analyzing database health: {obfuscate_password(str(e))}")
+        return format_error_response(str(e))
 
 
 @mcp.tool(
@@ -535,9 +589,10 @@ async def get_top_queries(
         default="resources",
     ),
     limit: int = Field(description="Number of queries to return when ranking based on mean_time or total_time", default=10),
+    database: str | None = Field(description=DATABASE_PARAM_DESCRIPTION, default=None),
 ) -> ResponseType:
     try:
-        sql_driver = await get_sql_driver()
+        sql_driver = await get_sql_driver(database)
         top_queries_tool = TopQueriesCalc(sql_driver=sql_driver)
 
         if sort_by == "resources":
@@ -554,10 +609,62 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _aliases_from_env() -> dict[str, str]:
+    """Collect DATABASE_URI_<ALIAS> environment variables as {alias: uri}."""
+    return {
+        key[len(ALIAS_ENV_PREFIX) :].lower(): value
+        for key, value in os.environ.items()
+        if key.startswith(ALIAS_ENV_PREFIX) and len(key) > len(ALIAS_ENV_PREFIX) and value
+    }
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
-    parser.add_argument("database_url", help="Database connection URL", nargs="?")
+    parser.add_argument(
+        "database_url",
+        help="Default database connection URL (optional; used when a tool call does not name a database)",
+        nargs="?",
+    )
+    parser.add_argument(
+        "--database",
+        dest="databases",
+        action="append",
+        default=[],
+        metavar="ALIAS=URI",
+        help="Register a named database that tools can target via their 'database' argument. "
+        f"Repeatable. Can also be set with {ALIAS_ENV_PREFIX}<ALIAS> environment variables.",
+    )
+    parser.add_argument(
+        "--allowed-hosts",
+        type=str,
+        default=os.environ.get("POSTGRES_MCP_ALLOWED_HOSTS"),
+        help="Comma-separated list of hosts that connection URIs passed in tool calls or the X-Database-URI header "
+        "may point to (env: POSTGRES_MCP_ALLOWED_HOSTS). Default: any host. Configured aliases are always allowed.",
+    )
+    parser.add_argument(
+        "--no-dynamic-uri",
+        action="store_true",
+        default=_env_flag("POSTGRES_MCP_NO_DYNAMIC_URI"),
+        help="Reject connection URIs in tool calls and headers; only the default database and configured aliases "
+        "are usable (env: POSTGRES_MCP_NO_DYNAMIC_URI=1)",
+    )
+    parser.add_argument(
+        "--max-pools",
+        type=int,
+        default=int(os.environ.get("POSTGRES_MCP_MAX_POOLS", DEFAULT_MAX_POOLS)),
+        help=f"Maximum number of cached connection pools, one per database (default: {DEFAULT_MAX_POOLS})",
+    )
+    parser.add_argument(
+        "--pool-idle-ttl",
+        type=float,
+        default=float(os.environ.get("POSTGRES_MCP_POOL_IDLE_TTL", DEFAULT_IDLE_TTL_SECONDS)),
+        help=f"Seconds after which an unused non-default pool is closed; 0 disables (default: {DEFAULT_IDLE_TTL_SECONDS:g})",
+    )
     parser.add_argument(
         "--access-mode",
         type=str,
@@ -625,25 +732,47 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
-    # Get database URL from environment variable or command line
-    database_url = os.environ.get("DATABASE_URI", args.database_url)
+    # Get the default database URL from environment variable or command line (optional)
+    database_url = os.environ.get("DATABASE_URI", args.database_url) or None
 
-    if not database_url:
+    aliases = _aliases_from_env()
+    for item in args.databases:
+        name, sep, uri = item.partition("=")
+        if not sep or not name.strip() or not uri.strip():
+            raise ValueError(f"Invalid --database value {obfuscate_password(item)!r}: expected ALIAS=URI")
+        aliases[name.strip().lower()] = uri.strip()
+
+    db_registry.configure(
+        default_uri=database_url,
+        aliases=aliases,
+        allow_dynamic_uri=not args.no_dynamic_uri,
+        allowed_hosts=args.allowed_hosts.split(",") if args.allowed_hosts else None,
+        max_pools=args.max_pools,
+        idle_ttl=args.pool_idle_ttl,
+    )
+
+    if aliases:
+        logger.info(f"Configured database aliases: {', '.join(sorted(aliases))}")
+    if not database_url and not aliases and args.no_dynamic_uri:
         raise ValueError(
-            "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
+            "Error: No database configured. Provide a default database ('DATABASE_URI' or command-line argument), "
+            "aliases (--database ALIAS=URI), or allow connection URIs in tool calls.",
         )
 
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+    if database_url:
+        # Connect the default pool eagerly so configuration problems show up at startup
+        try:
+            await db_registry.get_pool(database_url)
+            logger.info("Successfully connected to default database and initialized connection pool")
+        except Exception as e:
+            logger.warning(
+                f"Could not connect to default database: {obfuscate_password(str(e))}",
+            )
+            logger.warning(
+                "The MCP server will start but operations on the default database will fail until it is reachable.",
+            )
+    else:
+        logger.info("No default database configured: tool calls must name a database (argument or X-Database-URI header)")
 
     # Set up proper shutdown handling
     try:
@@ -685,7 +814,7 @@ async def shutdown(sig=None):
 
     # Close database connections
     try:
-        await db_connection.close()
+        await db_registry.close_all()
         logger.info("Closed database connections")
     except Exception as e:
         logger.error(f"Error closing database connections: {e}")

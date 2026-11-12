@@ -20,7 +20,7 @@ async def test_transport_argument_parsing(transport):
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.db_registry.get_pool", AsyncMock()),
             patch("postgres_mcp.server.mcp.run_stdio_async", AsyncMock()) as mock_stdio,
             patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()) as mock_sse,
             patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()) as mock_http,
@@ -61,7 +61,7 @@ async def test_streamable_http_host_port_arguments():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.db_registry.get_pool", AsyncMock()),
             patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()),
         ):
             await main()
@@ -90,7 +90,7 @@ async def test_sse_host_port_arguments():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.db_registry.get_pool", AsyncMock()),
             patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()),
         ):
             await main()
@@ -115,7 +115,7 @@ async def test_default_transport_is_stdio():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.db_registry.get_pool", AsyncMock()),
             patch("postgres_mcp.server.mcp.run_stdio_async", AsyncMock()) as mock_stdio,
             patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()) as mock_sse,
             patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()) as mock_http,
