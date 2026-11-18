@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 import time
 from abc import ABC
 from abc import abstractmethod
@@ -333,7 +334,7 @@ class IndexTuningBase(ABC):
             if not query_text:
                 logger.debug("Skipping empty query")
                 continue
-            query_text = query_text.strip().lower()
+            query_text = query_text.strip()
 
             # Replace parameter placeholders with dummy values
             query_text = await self._sql_bind_params.replace_parameters(query_text)
@@ -451,6 +452,7 @@ class IndexTuningBase(ABC):
         """Convenience function to log DTA thinking process."""
 
         # Always log to debug
+        print(f"[DTA {time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
         if exc_info:
             logger.debug(message, exc_info=True)
         else:
