@@ -13,6 +13,7 @@ from typing import Union
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
@@ -676,6 +677,13 @@ async def main():
         help="Host to bind SSE server to (default: localhost)",
     )
     parser.add_argument(
+        "--http-allowed-hosts",
+        type=str,
+        default=os.environ.get("POSTGRES_MCP_HTTP_ALLOWED_HOSTS"),
+        help="Comma-separated Host header values accepted by SSE / streamable HTTP, e.g. 'mcp.example.com:8000,10.0.0.5:*'. "
+        "Default: localhost only when bound to localhost, no check otherwise (env: POSTGRES_MCP_HTTP_ALLOWED_HOSTS)",
+    )
+    parser.add_argument(
         "--sse-port",
         type=int,
         default=8000,
@@ -778,11 +786,37 @@ async def main():
     elif args.transport == "sse":
         mcp.settings.host = args.sse_host
         mcp.settings.port = args.sse_port
+        mcp.settings.transport_security = http_transport_security(args.sse_host, args.http_allowed_hosts)
         await mcp.run_sse_async()
     elif args.transport == "streamable-http":
         mcp.settings.host = args.streamable_http_host
         mcp.settings.port = args.streamable_http_port
+        mcp.settings.transport_security = http_transport_security(args.streamable_http_host, args.http_allowed_hosts)
         await mcp.run_streamable_http_async()
+
+
+def http_transport_security(bind_host: str, allowed_hosts: str | None) -> TransportSecuritySettings | None:
+    """Host header check for HTTP transports.
+
+    FastMCP enables DNS rebinding protection for the default localhost bind and keeps it
+    when the host is changed later, so a server bound to 0.0.0.0 rejects every external
+    request with 421. Keep the check for loopback binds, apply an explicit host list if
+    given, otherwise turn it off.
+    """
+    hosts = [h.strip() for h in (allowed_hosts or "").split(",") if h.strip()]
+    if hosts:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+            allowed_origins=[f"http://{h}" for h in hosts] + [f"https://{h}" for h in hosts],
+        )
+    if bind_host in ("localhost", "127.0.0.1", "::1"):
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
 async def shutdown(sig=None):
