@@ -220,35 +220,30 @@ Replace `postgresql://...` with your [Postgres database connection URI](https://
 
 ##### Multiple Databases
 
-One server instance can work with any number of databases. Every tool takes an optional `database` argument; the database for a call is picked in this order:
+One server instance can work with several databases. The set of databases is fixed by the server's configuration: tools pick a database **by name only**, and connection strings passed by the model are rejected.
 
-1. the `database` argument: an alias (see below) or a full connection URI,
-2. the `X-Database-URI` HTTP header (SSE and streamable HTTP transports only), which also accepts an alias or a URI,
-3. the default database from `DATABASE_URI` or the command-line argument.
-
-The default database is optional: without it, every call must name a database.
-
-Register named databases (aliases) so the model can switch between them without ever seeing passwords:
+Each database is an environment variable `DATABASE_URI_<NAME>=<connection URI>`; the name is the part after the prefix, lower-cased:
 
 ```bash
-postgres-mcp postgresql://user:pass@localhost/main \
-  --database analytics=postgresql://user:pass@analytics-host/analytics \
-  --database billing=postgresql://user:pass@billing-host/billing
+DATABASE_URI_SHOP=postgresql://user:pass@shop-host:5432/shop \
+DATABASE_URI_CRM=postgresql://user:pass@crm-host:5432/crm \
+POSTGRES_MCP_DEFAULT_DATABASE=shop \
+postgres-mcp --transport streamable-http
 ```
 
-Aliases can also come from environment variables named `DATABASE_URI_<ALIAS>`, for example `DATABASE_URI_ANALYTICS=postgresql://...`. The `list_databases` tool shows the configured aliases (host, port and database name only, no credentials).
+The `list_databases` tool returns the databases this instance can work with (name, host:port/database, which one is the default; never credentials). Every other tool takes an optional `database` argument with one of those names. When it is omitted, the server uses, in order: the `X-Database` HTTP header (SSE and streamable HTTP only; also a name, not a connection string), then the default database.
 
-Connection pools are created on first use and cached per database. Related options:
+The default database is `POSTGRES_MCP_DEFAULT_DATABASE` if set, otherwise `default` (the legacy `DATABASE_URI` variable or command-line URI, which still works), otherwise the only configured database if there is exactly one. With several databases and no default, every call must name one.
+
+To add databases without restarting the server, point it at an env file with the same `DATABASE_URI_<NAME>=...` lines. The file is re-read when it changes; entries in it override process environment variables, and pools of databases removed from it are closed.
 
 | Option | Environment variable | Default | Meaning |
 |--------|----------------------|---------|---------|
-| `--database ALIAS=URI` | `DATABASE_URI_<ALIAS>` | none | Register a named database. Repeatable. |
-| `--allowed-hosts h1,h2` | `POSTGRES_MCP_ALLOWED_HOSTS` | any host | Hosts that connection URIs from tool calls or headers may point to. Aliases and the default database are always allowed. |
-| `--no-dynamic-uri` | `POSTGRES_MCP_NO_DYNAMIC_URI=1` | off | Accept only aliases and the default database, never raw connection URIs. |
+| `--db-env-prefix PREFIX` | `POSTGRES_MCP_DB_ENV_PREFIX` | `DATABASE_URI_` | Prefix of the variables that define databases. |
+| `--db-env-file PATH` | `POSTGRES_MCP_DB_ENV_FILE` | none | Extra `PREFIX<NAME>=URI` lines, re-read on change. |
+| `--default-database NAME` | `POSTGRES_MCP_DEFAULT_DATABASE` | see above | Database used when a call names none. |
 | `--max-pools N` | `POSTGRES_MCP_MAX_POOLS` | 10 | Maximum cached pools; the least recently used one is closed first. The default database's pool is never closed. |
 | `--pool-idle-ttl SECONDS` | `POSTGRES_MCP_POOL_IDLE_TTL` | 600 | Close pools unused for this long (`0` disables). |
-
-A connection URI passed in the `database` argument goes through the model's context, so it ends up in the conversation history. Prefer aliases, or the `X-Database-URI` header on HTTP transports. When the server is reachable over the network, set `--allowed-hosts` or `--no-dynamic-uri` so it cannot be pointed at arbitrary hosts.
 
 
 ##### Access Mode
@@ -373,7 +368,7 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
-| `list_databases` | Lists the databases the server is configured for (aliases usable as the `database` argument of the other tools), without credentials. |
+| `list_databases` | Lists the databases this server instance can work with (names usable as the `database` argument of the other tools), without credentials. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |
@@ -384,7 +379,7 @@ Postgres MCP Pro Tools:
 | `analyze_query_indexes` | Analyzes a list of specific SQL queries (up to 10) and recommends optimal indexes for them. |
 | `analyze_db_health` | Performs comprehensive health checks including: buffer cache hit rates, connection health, constraint validation, index health (duplicate/unused/invalid), sequence limits, and vacuum health. |
 
-All tools except `list_databases` accept an optional `database` argument (an alias or a connection URI); see [Multiple Databases](#multiple-databases).
+All tools except `list_databases` accept an optional `database` argument: the name of a configured database; see [Multiple Databases](#multiple-databases).
 
 
 ## Related Projects

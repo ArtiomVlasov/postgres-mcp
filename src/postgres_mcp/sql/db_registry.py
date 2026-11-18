@@ -1,25 +1,32 @@
-"""Registry of connection pools for serving several databases from one server.
+"""Registry of the databases a server instance may work with, and their connection pools.
 
-A single server instance can work with many databases. The database for a
-tool call is resolved in this order:
+The set of databases is fixed by configuration, never by the model:
 
-1. the ``database`` argument of the tool (an alias or a connection URI),
-2. the ``X-Database-URI`` HTTP header (sse / streamable-http transports only),
-3. the default database the server was started with (``DATABASE_URI``).
+* environment variables ``<PREFIX><NAME>=<connection URI>`` (default prefix ``DATABASE_URI_``),
+  e.g. ``DATABASE_URI_CRM=postgresql://...`` registers the database ``crm``;
+* optionally an env file with the same ``KEY=VALUE`` lines, re-read whenever it changes,
+  so databases can be added or removed without restarting the server;
+* the legacy ``DATABASE_URI`` variable / command-line URI, registered as ``default``.
 
-Pools are created lazily, cached per connection string, and evicted when
-idle for too long or when the cache is full (least recently used first).
-The default pool is never evicted.
+Tools refer to databases by name only. Connection strings coming from a tool call
+or a request header are rejected.
+
+Pools are created lazily, cached per database, and closed when idle for too long,
+when the cache is full (least recently used first) or when the database disappears
+from the configuration. The default database's pool is never evicted.
 """
 
 import asyncio
 import logging
+import os
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 from typing import Any
-from typing import Iterable
+from typing import Mapping
 from typing import Optional
 
 import psycopg
@@ -30,10 +37,13 @@ from .sql_driver import obfuscate_password
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALIAS = "default"
+DEFAULT_ENV_PREFIX = "DATABASE_URI_"
+DEFAULT_NAME = "default"
 DEFAULT_MAX_POOLS = 10
 DEFAULT_IDLE_TTL_SECONDS = 600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
+
+_ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 
 
 class DatabaseResolutionError(ValueError):
@@ -41,19 +51,8 @@ class DatabaseResolutionError(ValueError):
 
 
 def looks_like_conninfo(value: str) -> bool:
-    """Whether a value is a connection string rather than an alias name."""
-    return "://" in value or "=" in value
-
-
-def conninfo_hosts(uri: str) -> list[str]:
-    """Return the hosts a connection string points to ('localhost' for unix sockets / no host)."""
-    try:
-        params = conninfo_to_dict(uri)
-    except Exception as e:
-        raise DatabaseResolutionError(f"Invalid connection string: {obfuscate_password(str(e))}") from e
-    host = params.get("host") or params.get("hostaddr") or ""
-    hosts = [h.strip().lower() for h in str(host).split(",") if h.strip()]
-    return [("localhost" if h.startswith("/") else h) for h in hosts] or ["localhost"]
+    """Whether a value is a connection string rather than a database name."""
+    return "://" in value or "=" in value or "@" in value
 
 
 def describe_conninfo(uri: str) -> str:
@@ -61,11 +60,34 @@ def describe_conninfo(uri: str) -> str:
     try:
         params = conninfo_to_dict(uri)
     except Exception:
-        return obfuscate_password(uri) or ""
+        return "<invalid connection string>"
     host = params.get("host") or "localhost"
     port = params.get("port") or "5432"
     dbname = params.get("dbname") or params.get("user") or ""
     return f"{host}:{port}/{dbname}"
+
+
+def parse_env_file(text: str) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines (``#`` comments, optional ``export`` and quotes)."""
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _ENV_LINE.match(line)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def databases_from_env(env: Mapping[str, str], prefix: str) -> dict[str, str]:
+    """Collect ``<prefix><NAME>`` variables as ``{name: uri}`` (names lower-cased)."""
+    return {
+        key[len(prefix) :].lower(): value.strip() for key, value in env.items() if key.startswith(prefix) and len(key) > len(prefix) and value.strip()
+    }
 
 
 @dataclass
@@ -76,129 +98,171 @@ class _PoolEntry:
 
 
 class DatabaseRegistry:
-    """Resolves which database a request targets and hands out cached pools."""
+    """Resolves which configured database a request targets and hands out cached pools."""
 
     def __init__(
         self,
-        default_uri: Optional[str] = None,
-        aliases: Optional[dict[str, str]] = None,
-        allow_dynamic_uri: bool = True,
-        allowed_hosts: Optional[Iterable[str]] = None,
+        prefix: str = DEFAULT_ENV_PREFIX,
+        env_file: Optional[str] = None,
+        fallback_default_uri: Optional[str] = None,
+        default_name: Optional[str] = None,
         max_pools: int = DEFAULT_MAX_POOLS,
         idle_ttl: float = DEFAULT_IDLE_TTL_SECONDS,
+        environ: Optional[Mapping[str, str]] = None,
     ):
-        self.configure(
-            default_uri=default_uri,
-            aliases=aliases,
-            allow_dynamic_uri=allow_dynamic_uri,
-            allowed_hosts=allowed_hosts,
-            max_pools=max_pools,
-            idle_ttl=idle_ttl,
-        )
         self._pools: OrderedDict[str, _PoolEntry] = OrderedDict()
         self._lock = asyncio.Lock()
         self._key_locks: dict[str, asyncio.Lock] = {}
         self._closing: set[asyncio.Task[None]] = set()
+        self.configure(
+            prefix=prefix,
+            env_file=env_file,
+            fallback_default_uri=fallback_default_uri,
+            default_name=default_name,
+            max_pools=max_pools,
+            idle_ttl=idle_ttl,
+            environ=environ,
+        )
 
     def configure(
         self,
-        default_uri: Optional[str] = None,
-        aliases: Optional[dict[str, str]] = None,
-        allow_dynamic_uri: bool = True,
-        allowed_hosts: Optional[Iterable[str]] = None,
+        prefix: str = DEFAULT_ENV_PREFIX,
+        env_file: Optional[str] = None,
+        fallback_default_uri: Optional[str] = None,
+        default_name: Optional[str] = None,
         max_pools: int = DEFAULT_MAX_POOLS,
         idle_ttl: float = DEFAULT_IDLE_TTL_SECONDS,
+        environ: Optional[Mapping[str, str]] = None,
     ) -> None:
-        self.default_uri = default_uri or None
-        self.aliases = {k.lower(): v for k, v in (aliases or {}).items()}
-        self.allow_dynamic_uri = allow_dynamic_uri
-        hosts = {h.strip().lower() for h in (allowed_hosts or []) if h and h.strip()}
-        self.allowed_hosts: Optional[set[str]] = hosts or None
+        """
+        Args:
+            prefix: environment variable prefix that marks a database (``DATABASE_URI_`` -> ``DATABASE_URI_CRM``).
+            env_file: optional file with extra ``KEY=VALUE`` lines, re-read when it changes.
+            fallback_default_uri: legacy single database (``DATABASE_URI`` / CLI argument), registered as ``default``.
+            default_name: database used when a call names none. Defaults to ``default`` if configured,
+                or to the only database if exactly one is configured.
+            environ: environment to read (``os.environ`` when omitted; read on every lookup).
+        """
+        if not prefix:
+            raise ValueError("Database environment prefix must not be empty")
+        self.prefix = prefix
+        self.env_file = Path(env_file) if env_file else None
+        self.fallback_default_uri = fallback_default_uri or None
+        self.default_name = default_name.strip().lower() if default_name and default_name.strip() else None
         self.max_pools = max(1, max_pools)
         self.idle_ttl = idle_ttl
+        self._environ = environ
+        self._file_mtime: Optional[float] = None
+        self._file_values: dict[str, str] = {}
+
+    # ------------------------------------------------------------------ configuration
+
+    def _read_env_file(self) -> dict[str, str]:
+        if self.env_file is None:
+            return {}
+        try:
+            mtime = self.env_file.stat().st_mtime
+        except FileNotFoundError:
+            if self._file_mtime is not None:
+                logger.warning(f"Database env file {self.env_file} disappeared")
+            self._file_mtime, self._file_values = None, {}
+            return {}
+        if mtime != self._file_mtime:
+            try:
+                self._file_values = parse_env_file(self.env_file.read_text())
+                self._file_mtime = mtime
+                logger.info(f"Loaded database env file {self.env_file}")
+            except OSError as e:
+                logger.warning(f"Could not read database env file {self.env_file}: {e}")
+        return self._file_values
+
+    def databases(self) -> dict[str, str]:
+        """Current ``{name: uri}`` map. The env file overrides the process environment."""
+        env = os.environ if self._environ is None else self._environ
+        result: dict[str, str] = {}
+        if self.fallback_default_uri:
+            result[DEFAULT_NAME] = self.fallback_default_uri
+        result.update(databases_from_env(env, self.prefix))
+        result.update(databases_from_env(self._read_env_file(), self.prefix))
+        return result
+
+    def default_database(self, databases: Optional[dict[str, str]] = None) -> Optional[str]:
+        """Name of the database used when a call names none, if any."""
+        dbs = self.databases() if databases is None else databases
+        if self.default_name:
+            return self.default_name if self.default_name in dbs else None
+        if DEFAULT_NAME in dbs:
+            return DEFAULT_NAME
+        if len(dbs) == 1:
+            return next(iter(dbs))
+        return None
 
     # ------------------------------------------------------------------ resolution
 
-    def resolve(self, database: Optional[str] = None, header_value: Optional[str] = None) -> str:
-        """Pick the connection string for a request.
+    def resolve(self, database: Optional[str] = None, header_value: Optional[str] = None) -> tuple[str, str]:
+        """Pick ``(name, uri)`` for a request.
 
         ``database`` (tool argument) wins over ``header_value`` (HTTP header),
-        which wins over the default database.
+        which wins over the default database. Both must be configured names.
         """
-        for value, source in ((database, "tool argument 'database'"), (header_value, "X-Database-URI header")):
+        dbs = self.databases()
+        for value, source in ((database, "tool argument 'database'"), (header_value, "X-Database header")):
             if isinstance(value, str) and value.strip():
-                return self._resolve_value(value.strip(), source)
+                return self._resolve_name(value.strip(), source, dbs)
 
-        if self.default_uri:
-            return self.default_uri
+        default = self.default_database(dbs)
+        if default is not None:
+            return default, dbs[default]
 
-        known = ", ".join(sorted(self.aliases)) or "none"
+        if not dbs:
+            raise DatabaseResolutionError(f"No databases are configured on this server (set {self.prefix}<NAME> environment variables).")
         raise DatabaseResolutionError(
-            "No database specified and the server has no default database. "
-            "Pass 'database' (a configured alias or a postgresql:// URI). "
-            f"Configured aliases: {known}."
+            f"No database specified and this server has no default database. Pass 'database', one of: {', '.join(sorted(dbs))}."
         )
 
-    def _resolve_value(self, value: str, source: str) -> str:
-        alias = value.lower()
-        if alias == DEFAULT_ALIAS and DEFAULT_ALIAS not in self.aliases:
-            if not self.default_uri:
-                raise DatabaseResolutionError("The server has no default database configured.")
-            return self.default_uri
-        if alias in self.aliases:
-            return self.aliases[alias]
-
-        if not looks_like_conninfo(value):
-            known = ", ".join(sorted(self.aliases | ({DEFAULT_ALIAS: ""} if self.default_uri else {}))) or "none"
-            raise DatabaseResolutionError(f"Unknown database alias '{value}' ({source}). Known aliases: {known}.")
-
-        if not self.allow_dynamic_uri:
+    def _resolve_name(self, value: str, source: str, dbs: dict[str, str]) -> tuple[str, str]:
+        known = ", ".join(sorted(dbs)) or "none"
+        if looks_like_conninfo(value):
+            # Never echo the value back: it may contain a password.
             raise DatabaseResolutionError(
-                f"Connection strings in the {source} are disabled on this server. Use one of the configured aliases (see list_databases)."
+                f"Connection strings are not accepted in the {source}. Use the name of a configured database (see list_databases): {known}."
             )
-        if self.allowed_hosts is not None:
-            denied = [h for h in conninfo_hosts(value) if h not in self.allowed_hosts]
-            if denied:
-                raise DatabaseResolutionError(f"Host(s) not allowed: {', '.join(denied)}. Allowed hosts: {', '.join(sorted(self.allowed_hosts))}.")
-        else:
-            # Still validate the string so errors come back early and readable.
-            conninfo_hosts(value)
-        return value
+        name = value.lower()
+        if name not in dbs:
+            raise DatabaseResolutionError(f"Unknown database '{value}' ({source}). Available databases: {known}.")
+        return name, dbs[name]
 
-    def describe(self) -> dict[str, Any]:
-        """Configuration summary safe to show to a model (no credentials)."""
-        databases = []
-        if self.default_uri:
-            databases.append({"alias": DEFAULT_ALIAS, "target": describe_conninfo(self.default_uri), "default": True})
-        for alias, uri in sorted(self.aliases.items()):
-            databases.append({"alias": alias, "target": describe_conninfo(uri), "default": False})
-        return {
-            "databases": databases,
-            "connection_strings_allowed": self.allow_dynamic_uri,
-            "allowed_hosts": sorted(self.allowed_hosts) if self.allowed_hosts is not None else "any",
-        }
+    def describe(self) -> list[dict[str, Any]]:
+        """Configured databases, safe to show to a model (no credentials)."""
+        dbs = self.databases()
+        default = self.default_database(dbs)
+        return [{"name": name, "target": describe_conninfo(uri), "default": name == default} for name, uri in sorted(dbs.items())]
 
     # ------------------------------------------------------------------ pools
 
+    def _touch(self, uri: str) -> Optional[DbConnPool]:
+        entry = self._pools.get(uri)
+        if entry is None:
+            return None
+        entry.last_used = time.monotonic()
+        self._pools.move_to_end(uri)
+        return entry.pool
+
     async def get_pool(self, uri: str) -> DbConnPool:
-        """Return a connected pool for ``uri``, creating it if needed."""
+        """Return a connected pool for ``uri`` (a value from ``resolve``), creating it if needed."""
         async with self._lock:
-            self._evict_idle()
-            entry = self._pools.get(uri)
-            if entry is not None:
-                entry.last_used = time.monotonic()
-                self._pools.move_to_end(uri)
-                return entry.pool
+            self._evict_stale()
+            pool = self._touch(uri)
+            if pool is not None:
+                return pool
             key_lock = self._key_locks.setdefault(uri, asyncio.Lock())
 
         async with key_lock:
             # Someone else may have created it while we waited.
             async with self._lock:
-                entry = self._pools.get(uri)
-                if entry is not None:
-                    entry.last_used = time.monotonic()
-                    self._pools.move_to_end(uri)
-                    return entry.pool
+                pool = self._touch(uri)
+                if pool is not None:
+                    return pool
 
             await self._probe(uri)
             pool = DbConnPool(uri)
@@ -206,7 +270,9 @@ class DatabaseRegistry:
             logger.info(f"Opened connection pool for {describe_conninfo(uri)}")
 
             async with self._lock:
-                self._pools[uri] = _PoolEntry(pool=pool, pinned=(uri == self.default_uri))
+                dbs = self.databases()
+                default = self.default_database(dbs)
+                self._pools[uri] = _PoolEntry(pool=pool, pinned=default is not None and dbs.get(default) == uri)
                 self._key_locks.pop(uri, None)
                 self._evict_overflow()
             return pool
@@ -220,7 +286,11 @@ class DatabaseRegistry:
             raise ValueError(f"Connection attempt failed for {describe_conninfo(uri)}: {obfuscate_password(str(e).strip())}") from e
         await conn.close()
 
-    def _evict_idle(self) -> None:
+    def _evict_stale(self) -> None:
+        """Close pools of databases removed from the configuration, and idle ones."""
+        configured = set(self.databases().values())
+        for key in [k for k in self._pools if k not in configured]:
+            self._evict(key, "removed from configuration")
         if self.idle_ttl <= 0:
             return
         now = time.monotonic()

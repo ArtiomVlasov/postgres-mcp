@@ -28,7 +28,7 @@ async def test_force_readonly_enforcement():
     # Test UNRESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.UNRESTRICTED),
-        patch("postgres_mcp.server.db_registry.default_uri", "postgresql://localhost/test"),
+        patch("postgres_mcp.server.db_registry.resolve", return_value=("default", "postgresql://localhost/test")),
         patch("postgres_mcp.server.db_registry.get_pool", AsyncMock(return_value=mock_conn_pool)),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):
@@ -60,7 +60,7 @@ async def test_force_readonly_enforcement():
     # Test RESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.RESTRICTED),
-        patch("postgres_mcp.server.db_registry.default_uri", "postgresql://localhost/test"),
+        patch("postgres_mcp.server.db_registry.resolve", return_value=("default", "postgresql://localhost/test")),
         patch("postgres_mcp.server.db_registry.get_pool", AsyncMock(return_value=mock_conn_pool)),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):

@@ -32,6 +32,7 @@ from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
+from .sql.db_registry import DEFAULT_ENV_PREFIX
 from .sql.db_registry import DEFAULT_IDLE_TTL_SECONDS
 from .sql.db_registry import DEFAULT_MAX_POOLS
 from .top_queries import TopQueriesCalc
@@ -42,11 +43,11 @@ mcp = FastMCP("postgres-mcp")
 # Constants
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
-DATABASE_URI_HEADER = "x-database-uri"
-ALIAS_ENV_PREFIX = "DATABASE_URI_"
+DATABASE_HEADER = "x-database"
 
 DATABASE_PARAM_DESCRIPTION = (
-    "Optional. Database to run against: an alias from list_databases, or a postgresql:// connection URI. Omit to use the server's default database."
+    "Optional. Name of the database to run against, one of those returned by list_databases. "
+    "Connection strings are not accepted. Omit to use the server's default database."
 )
 
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
@@ -68,7 +69,7 @@ shutdown_in_progress = False
 
 
 def _database_from_request_headers() -> str | None:
-    """Value of the X-Database-URI header for HTTP transports, None for stdio or outside a request."""
+    """Value of the X-Database header (a database name) for HTTP transports, None for stdio or outside a request."""
     try:
         request = mcp.get_context().request_context.request
     except (LookupError, ValueError):
@@ -76,18 +77,19 @@ def _database_from_request_headers() -> str | None:
     headers = getattr(request, "headers", None)
     if headers is None:
         return None
-    return headers.get(DATABASE_URI_HEADER)
+    return headers.get(DATABASE_HEADER)
 
 
 async def get_sql_driver(database: str | None = None) -> Union[SqlDriver, SafeSqlDriver]:
     """Get the SQL driver for the requested database, based on the current access mode.
 
-    ``database`` is an alias or connection URI; when omitted, the X-Database-URI header
+    ``database`` is the name of a configured database; when omitted, the X-Database header
     and then the server's default database are used.
     """
     if not isinstance(database, str):  # tools called directly may pass pydantic FieldInfo defaults
         database = None
-    uri = db_registry.resolve(database, _database_from_request_headers())
+    name, uri = db_registry.resolve(database, _database_from_request_headers())
+    logger.debug(f"Using database '{name}'")
     conn = await db_registry.get_pool(uri)
     base_driver = SqlDriver(conn=conn)
 
@@ -110,8 +112,8 @@ def format_error_response(error: str) -> ResponseType:
 
 
 @mcp.tool(
-    description="List the databases this server can work with (aliases usable as the 'database' argument of other tools) "
-    "and whether arbitrary connection URIs are accepted.",
+    description="List the databases this server instance can work with. Pass a database's 'name' as the 'database' "
+    "argument of the other tools; the one marked default is used when 'database' is omitted.",
     annotations=ToolAnnotations(
         title="List Databases",
         readOnlyHint=True,
@@ -119,7 +121,10 @@ def format_error_response(error: str) -> ResponseType:
 )
 async def list_databases() -> ResponseType:
     """List configured databases without exposing credentials."""
-    return format_text_response(db_registry.describe())
+    databases = db_registry.describe()
+    if not databases:
+        return format_error_response(f"No databases are configured on this server (set {db_registry.prefix}<NAME> environment variables).")
+    return format_text_response(databases)
 
 
 @mcp.tool(
@@ -609,19 +614,6 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _aliases_from_env() -> dict[str, str]:
-    """Collect DATABASE_URI_<ALIAS> environment variables as {alias: uri}."""
-    return {
-        key[len(ALIAS_ENV_PREFIX) :].lower(): value
-        for key, value in os.environ.items()
-        if key.startswith(ALIAS_ENV_PREFIX) and len(key) > len(ALIAS_ENV_PREFIX) and value
-    }
-
-
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -631,27 +623,25 @@ async def main():
         nargs="?",
     )
     parser.add_argument(
-        "--database",
-        dest="databases",
-        action="append",
-        default=[],
-        metavar="ALIAS=URI",
-        help="Register a named database that tools can target via their 'database' argument. "
-        f"Repeatable. Can also be set with {ALIAS_ENV_PREFIX}<ALIAS> environment variables.",
-    )
-    parser.add_argument(
-        "--allowed-hosts",
+        "--db-env-prefix",
         type=str,
-        default=os.environ.get("POSTGRES_MCP_ALLOWED_HOSTS"),
-        help="Comma-separated list of hosts that connection URIs passed in tool calls or the X-Database-URI header "
-        "may point to (env: POSTGRES_MCP_ALLOWED_HOSTS). Default: any host. Configured aliases are always allowed.",
+        default=os.environ.get("POSTGRES_MCP_DB_ENV_PREFIX", DEFAULT_ENV_PREFIX),
+        help="Prefix of environment variables that define the databases this server may use, e.g. "
+        f"{DEFAULT_ENV_PREFIX}CRM=postgresql://... registers 'crm' (env: POSTGRES_MCP_DB_ENV_PREFIX, default: {DEFAULT_ENV_PREFIX})",
     )
     parser.add_argument(
-        "--no-dynamic-uri",
-        action="store_true",
-        default=_env_flag("POSTGRES_MCP_NO_DYNAMIC_URI"),
-        help="Reject connection URIs in tool calls and headers; only the default database and configured aliases "
-        "are usable (env: POSTGRES_MCP_NO_DYNAMIC_URI=1)",
+        "--db-env-file",
+        type=str,
+        default=os.environ.get("POSTGRES_MCP_DB_ENV_FILE"),
+        help="Optional file with more <PREFIX><NAME>=<URI> lines. It is re-read when it changes, so databases can be "
+        "added or removed without a restart (env: POSTGRES_MCP_DB_ENV_FILE)",
+    )
+    parser.add_argument(
+        "--default-database",
+        type=str,
+        default=os.environ.get("POSTGRES_MCP_DEFAULT_DATABASE"),
+        help="Name of the database used when a tool call names none (env: POSTGRES_MCP_DEFAULT_DATABASE). "
+        "Default: 'default' (DATABASE_URI) if set, or the only configured database",
     )
     parser.add_argument(
         "--max-pools",
@@ -732,47 +722,44 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
-    # Get the default database URL from environment variable or command line (optional)
+    # Legacy single database (DATABASE_URI or command line), registered as 'default'
     database_url = os.environ.get("DATABASE_URI", args.database_url) or None
 
-    aliases = _aliases_from_env()
-    for item in args.databases:
-        name, sep, uri = item.partition("=")
-        if not sep or not name.strip() or not uri.strip():
-            raise ValueError(f"Invalid --database value {obfuscate_password(item)!r}: expected ALIAS=URI")
-        aliases[name.strip().lower()] = uri.strip()
-
     db_registry.configure(
-        default_uri=database_url,
-        aliases=aliases,
-        allow_dynamic_uri=not args.no_dynamic_uri,
-        allowed_hosts=args.allowed_hosts.split(",") if args.allowed_hosts else None,
+        prefix=args.db_env_prefix,
+        env_file=args.db_env_file,
+        fallback_default_uri=database_url,
+        default_name=args.default_database,
         max_pools=args.max_pools,
         idle_ttl=args.pool_idle_ttl,
     )
 
-    if aliases:
-        logger.info(f"Configured database aliases: {', '.join(sorted(aliases))}")
-    if not database_url and not aliases and args.no_dynamic_uri:
+    databases = db_registry.databases()
+    default_name = db_registry.default_database(databases)
+    if databases:
+        logger.info(f"Configured databases: {', '.join(sorted(databases))}; default: {default_name or 'none'}")
+    elif args.db_env_file:
+        logger.warning(f"No databases configured yet; waiting for {args.db_env_prefix}<NAME> entries in {args.db_env_file}")
+    else:
         raise ValueError(
-            "Error: No database configured. Provide a default database ('DATABASE_URI' or command-line argument), "
-            "aliases (--database ALIAS=URI), or allow connection URIs in tool calls.",
+            f"Error: No databases configured. Set {args.db_env_prefix}<NAME>=<connection URI> environment variables "
+            "(or DATABASE_URI for a single database).",
         )
+    if args.default_database and default_name is None:
+        logger.warning(f"Default database '{args.default_database}' is not configured")
 
-    if database_url:
+    if default_name is not None:
         # Connect the default pool eagerly so configuration problems show up at startup
         try:
-            await db_registry.get_pool(database_url)
-            logger.info("Successfully connected to default database and initialized connection pool")
+            await db_registry.get_pool(databases[default_name])
+            logger.info(f"Successfully connected to default database '{default_name}'")
         except Exception as e:
             logger.warning(
-                f"Could not connect to default database: {obfuscate_password(str(e))}",
+                f"Could not connect to default database '{default_name}': {obfuscate_password(str(e))}",
             )
             logger.warning(
                 "The MCP server will start but operations on the default database will fail until it is reachable.",
             )
-    else:
-        logger.info("No default database configured: tool calls must name a database (argument or X-Database-URI header)")
 
     # Set up proper shutdown handling
     try:
