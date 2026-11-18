@@ -1,5 +1,19 @@
+import re
 from dataclasses import dataclass
 from typing import Any
+
+
+def quote_ident(ident: str) -> str:
+    """Quote an identifier (or each part of a dotted name) unless it is an expression or already safe as is."""
+    if "(" in ident or " " in ident:
+        return ident
+    parts = []
+    for p in ident.split("."):
+        if p.startswith('"') or re.fullmatch(r"[a-z_][a-z0-9_$]*", p):
+            parts.append(p)
+        else:
+            parts.append('"' + p.replace('"', '""') + '"')
+    return ".".join(parts)
 
 
 @dataclass(frozen=True)
@@ -20,7 +34,7 @@ class IndexDefinition:
 
     @property
     def definition(self) -> str:
-        return f"CREATE INDEX {self.name} ON {self.table} USING {self.using} ({', '.join(self.columns)})"
+        return f"CREATE INDEX {self.name} ON {quote_ident(self.table)} USING {self.using} ({', '.join(quote_ident(c) for c in self.columns)})"
 
     @property
     def name(self) -> str:
@@ -43,7 +57,7 @@ class IndexDefinition:
         column_part = "_".join(cleaned_columns)
         suffix = "" if self.using == "btree" else f"_{self.using}"
         base = f"crystaldba_idx_{self.table}_{column_part}_{len(self.columns)}"
-        return f"{base}{suffix}"
+        return re.sub(r"[^a-z0-9_]+", "_", f"{base}{suffix}".lower()).strip("_")[:63]
 
     def __str__(self) -> str:
         return self.definition

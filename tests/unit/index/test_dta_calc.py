@@ -17,6 +17,7 @@ from postgres_mcp.index.dta_calc import ColumnCollector
 from postgres_mcp.index.dta_calc import ConditionColumnCollector
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 from postgres_mcp.index.dta_calc import IndexRecommendation
+from postgres_mcp.sql import IndexDefinition
 
 logger = getLogger(__name__)
 
@@ -134,6 +135,8 @@ async def test_generate_candidates(async_sql_driver, create_dta):
                 }
             )
         ],
+        # existing tables and columns
+        [MockCell({"n": 0, "ok": True, "attname": "name"})],
         # create index users.name
         [MockCell({"indexrelid": 123})],
         # pg_stat_statements
@@ -188,6 +191,8 @@ async def test_analyze_workload(async_sql_driver, create_dta):
                 return [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 100.0}}]})]  # Current cost
         elif "hypopg_reset" in query:
             return None
+        elif "to_regclass" in query:
+            return [MockCell({"n": 0, "ok": True, "attname": "id"})]
         elif "FROM information_schema.columns c" in query:
             return [
                 MockCell(
@@ -522,6 +527,11 @@ async def test_basic_workload_analysis(async_sql_driver):
                     "potential_long_text": False,
                 }
             ),
+        ],
+        # existing tables and columns (orders, users)
+        [
+            MockCell({"n": 0, "ok": True, "attname": "user_id"}),
+            MockCell({"n": 1, "ok": True, "attname": "name"}),
         ],
         # hypopg_create_index (for users.name, orders.user_id)
         [MockCell({"indexrelid": 1554}), MockCell({"indexrelid": 1555})],
@@ -1287,3 +1297,40 @@ async def cleanup_pools():
 
 if __name__ == "__main__":
     pytest.main()
+
+
+@pytest.mark.asyncio
+async def test_filter_unknown_relations(async_sql_driver, create_dta):
+    """Candidates on aliases, missing tables or missing columns are dropped."""
+    async_sql_driver.execute_query = AsyncMock(
+        return_value=[
+            MockCell({"n": 0, "ok": True, "attname": "c_state"}),
+            MockCell({"n": 0, "ok": True, "attname": "c_date"}),
+            MockCell({"n": 1, "ok": False, "attname": None}),
+        ]
+    )
+    dta = create_dta
+    candidates = [
+        IndexRecommendation(table="Z#DOC", columns=("c_state",)),
+        IndexRecommendation(table="Z#DOC", columns=("c_state", "collection_id")),
+        IndexRecommendation(table="b1", columns=("c_state",)),
+    ]
+    kept = await dta._filter_unknown_relations(candidates)
+    assert [(c.table, c.columns) for c in kept] == [("Z#DOC", ("c_state",))]
+    query = async_sql_driver.execute_query.call_args[0][0]
+    assert "'\"Z#DOC\"'" in query and "'\"b1\"'" in query
+
+
+def test_index_definition_quotes_identifiers():
+    idx = IndexDefinition(table="Z#DOC", columns=("C_STATE", "c_date", "lower(c_name)"))
+    assert idx.definition.startswith("CREATE INDEX crystaldba_idx_z_doc_c_state_c_date_lower_c_name_3 ON ")
+    assert idx.definition.endswith('ON "Z#DOC" USING btree ("C_STATE", c_date, lower(c_name))')
+    assert len(IndexDefinition(table="t" * 80, columns=("c",)).name) <= 63
+
+
+def test_max_runtime_from_env(async_sql_driver, monkeypatch):
+    monkeypatch.setenv("DTA_MAX_RUNTIME_SECONDS", "1234")
+    assert DatabaseTuningAdvisor(sql_driver=async_sql_driver).max_runtime_seconds == 1234
+    monkeypatch.delenv("DTA_MAX_RUNTIME_SECONDS")
+    assert DatabaseTuningAdvisor(sql_driver=async_sql_driver).max_runtime_seconds == 600
+    assert DatabaseTuningAdvisor(sql_driver=async_sql_driver, max_runtime_seconds=5).max_runtime_seconds == 5

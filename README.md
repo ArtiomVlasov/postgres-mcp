@@ -218,6 +218,34 @@ The Postgres MCP Pro Docker image will automatically remap the hostname `localho
 Replace `postgresql://...` with your [Postgres database connection URI](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS).
 
 
+##### Multiple Databases
+
+One server instance can work with several databases. The set of databases is fixed by the server's configuration: tools pick a database **by name only**, and connection strings passed by the model are rejected.
+
+Each database is an environment variable `DATABASE_URI_<NAME>=<connection URI>`; the name is the part after the prefix, lower-cased:
+
+```bash
+DATABASE_URI_SHOP=postgresql://user:pass@shop-host:5432/shop \
+DATABASE_URI_CRM=postgresql://user:pass@crm-host:5432/crm \
+POSTGRES_MCP_DEFAULT_DATABASE=shop \
+postgres-mcp --transport streamable-http
+```
+
+The `list_databases` tool returns the databases this instance can work with (name, host:port/database, which one is the default; never credentials). Every other tool takes an optional `database` argument with one of those names. When it is omitted, the server uses, in order: the `X-Database` HTTP header (SSE and streamable HTTP only; also a name, not a connection string), then the default database.
+
+The default database is `POSTGRES_MCP_DEFAULT_DATABASE` if set, otherwise `default` (the legacy `DATABASE_URI` variable or command-line URI, which still works), otherwise the only configured database if there is exactly one. With several databases and no default, every call must name one.
+
+To add databases without restarting the server, point it at an env file with the same `DATABASE_URI_<NAME>=...` lines. The file is re-read when it changes; entries in it override process environment variables, and pools of databases removed from it are closed.
+
+| Option | Environment variable | Default | Meaning |
+|--------|----------------------|---------|---------|
+| `--db-env-prefix PREFIX` | `POSTGRES_MCP_DB_ENV_PREFIX` | `DATABASE_URI_` | Prefix of the variables that define databases. |
+| `--db-env-file PATH` | `POSTGRES_MCP_DB_ENV_FILE` | none | Extra `PREFIX<NAME>=URI` lines, re-read on change. |
+| `--default-database NAME` | `POSTGRES_MCP_DEFAULT_DATABASE` | see above | Database used when a call names none. |
+| `--max-pools N` | `POSTGRES_MCP_MAX_POOLS` | 10 | Maximum cached pools; the least recently used one is closed first. The default database's pool is never closed. |
+| `--pool-idle-ttl SECONDS` | `POSTGRES_MCP_POOL_IDLE_TTL` | 600 | Close pools unused for this long (`0` disables). |
+
+
 ##### Access Mode
 
 Postgres MCP Pro supports multiple *access modes* to give you control over the operations that the AI agent can perform on the database:
@@ -340,6 +368,7 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
+| `list_databases` | Lists the databases this server instance can work with (names usable as the `database` argument of the other tools), without credentials. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |
@@ -349,6 +378,8 @@ Postgres MCP Pro Tools:
 | `analyze_workload_indexes` | Analyzes the database workload to identify resource-intensive queries, then recommends optimal indexes for them. |
 | `analyze_query_indexes` | Analyzes a list of specific SQL queries (up to 10) and recommends optimal indexes for them. |
 | `analyze_db_health` | Performs comprehensive health checks including: buffer cache hit rates, connection health, constraint validation, index health (duplicate/unused/invalid), sequence limits, and vacuum health. |
+
+All tools except `list_databases` accept an optional `database` argument: the name of a configured database; see [Multiple Databases](#multiple-databases).
 
 
 ## Related Projects

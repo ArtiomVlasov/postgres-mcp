@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from itertools import combinations
 from typing import Any
@@ -31,7 +32,7 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         self,
         sql_driver: SqlDriver,
         budget_mb: int = -1,  # no limit by default
-        max_runtime_seconds: int = 30,  # 30 seconds
+        max_runtime_seconds: int | None = None,  # DTA_MAX_RUNTIME_SECONDS env, default 600
         max_index_width: int = 3,
         min_column_usage: int = 1,  # skip columns used in fewer than this many queries
         seed_columns_count: int = 3,  # how many single-col seeds to pick
@@ -50,6 +51,8 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         """
         super().__init__(sql_driver)
         self.budget_mb = budget_mb
+        if max_runtime_seconds is None:
+            max_runtime_seconds = int(os.environ.get("DTA_MAX_RUNTIME_SECONDS", "600"))
         self.max_runtime_seconds = max_runtime_seconds
         self.max_index_width = max_index_width
         self.min_column_usage = min_column_usage
@@ -161,10 +164,13 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         # filter out long text columns
         condition_filtered = await self._filter_long_text_columns(condition_filtered1)
 
+        # filter out aliases, unknown tables and columns that do not exist in them
+        condition_filtered = await self._filter_unknown_relations(condition_filtered)
+
         self.dta_trace(f"Generated {len(candidates)} total candidates")
         self.dta_trace(f"Filtered to {len(filtered_candidates)} after removing existing indexes.")
         self.dta_trace(f"Filtered to {len(condition_filtered1)} after removing unused columns.")
-        self.dta_trace(f"Filtered to {len(condition_filtered)} after removing long text columns.")
+        self.dta_trace(f"Filtered to {len(condition_filtered)} after removing long text columns and unknown tables/columns.")
         # Batch create all hypothetical indexes and store their size estimates
         if len(condition_filtered) > 0:
             query = "SELECT hypopg_create_index({});" * len(condition_filtered)
@@ -382,6 +388,32 @@ class DatabaseTuningAdvisor(IndexTuningBase):
                 filtered_candidates.append(candidate)
 
         return filtered_candidates
+
+    async def _filter_unknown_relations(self, candidates: list[IndexRecommendation]) -> list[IndexRecommendation]:
+        """Drop candidates whose table does not exist (e.g. a query alias) or whose columns are not in that table."""
+        if not candidates:
+            return []
+        tables = sorted({c.table for c in candidates})
+        idents = [".".join(p if p.startswith('"') else '"' + p.replace('"', '""') + '"' for p in t.split(".")) for t in tables]
+        values = ",".join("(" + str(i) + ", '" + ident.replace("'", "''") + "')" for i, ident in enumerate(idents))
+        result = await self.sql_driver.execute_query(
+            f"""
+            SELECT t.n, to_regclass(t.ident) IS NOT NULL AS ok, a.attname
+            FROM (VALUES {values}) AS t(n, ident)
+            LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(t.ident) AND a.attnum > 0 AND NOT a.attisdropped
+            """  # type: ignore
+        )
+        known: dict[str, set[str]] = {}
+        for row in result or []:
+            if row.cells.get("ok"):
+                cols = known.setdefault(tables[int(row.cells["n"])], set())
+                if row.cells.get("attname"):
+                    cols.add(row.cells["attname"])
+        kept = [c for c in candidates if c.table in known and all("(" in col or col.strip('"') in known[c.table] for col in c.columns)]
+        dropped = len(candidates) - len(kept)
+        if dropped:
+            self.dta_trace(f"Dropped {dropped} candidates referencing unknown tables or columns.")
+        return kept
 
     async def _filter_long_text_columns(self, candidates: list[IndexRecommendation], max_text_length: int = 100) -> list[IndexRecommendation]:
         """Filter out indexes that contain long text columns based on catalog information.
