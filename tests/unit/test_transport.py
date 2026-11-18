@@ -127,3 +127,14 @@ async def test_default_transport_is_stdio():
             mock_http.assert_not_called()
     finally:
         sys.argv = original_argv
+
+
+def test_http_transport_security():
+    from postgres_mcp.server import http_transport_security
+
+    assert http_transport_security("0.0.0.0", None).enable_dns_rebinding_protection is False
+    local = http_transport_security("localhost", None)
+    assert local.enable_dns_rebinding_protection and "localhost:*" in local.allowed_hosts
+    explicit = http_transport_security("0.0.0.0", "mcp.example.com:8000, 10.0.0.5:*")
+    assert explicit.enable_dns_rebinding_protection
+    assert explicit.allowed_hosts == ["mcp.example.com:8000", "10.0.0.5:*"]
