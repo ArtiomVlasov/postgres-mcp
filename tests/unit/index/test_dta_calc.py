@@ -11,13 +11,16 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 from pglast import parse_sql
+from psycopg.errors import InternalError_
 
 from postgres_mcp.artifacts import ExplainPlanArtifact
 from postgres_mcp.index.dta_calc import ColumnCollector
 from postgres_mcp.index.dta_calc import ConditionColumnCollector
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 from postgres_mcp.index.dta_calc import IndexRecommendation
+from postgres_mcp.index.index_opt_base import IndexTuningResult
 from postgres_mcp.sql import IndexDefinition
+from postgres_mcp.sql.bind_params import UnresolvedBindParameterError
 
 logger = getLogger(__name__)
 
@@ -137,17 +140,13 @@ async def test_generate_candidates(async_sql_driver, create_dta):
         ],
         # existing tables and columns
         [MockCell({"n": 0, "ok": True, "attname": "name"})],
-        # create index users.name
-        [MockCell({"indexrelid": 123})],
-        # pg_stat_statements
+        # HypoPG size estimate
         [MockCell({"index_name": "crystaldba_idx_users_name_1", "index_size": 81920})],
-        # hypopg_reset
-        [],
     ]
     global responses_index
     responses_index = 0
 
-    async def mock_execute_query(query):
+    async def mock_execute_query(query, *, reset_hypopg=False):
         global responses_index
         responses_index += 1
         logger.info(
@@ -171,7 +170,7 @@ async def test_generate_candidates(async_sql_driver, create_dta):
 
 @pytest.mark.asyncio
 async def test_analyze_workload(async_sql_driver, create_dta):
-    async def mock_execute_query(query):
+    async def mock_execute_query(query, *, reset_hypopg=False):
         logger.info(f"Query: {query}")
         if "pg_stat_statements" in query:
             return [
@@ -533,8 +532,6 @@ async def test_basic_workload_analysis(async_sql_driver):
             MockCell({"n": 0, "ok": True, "attname": "user_id"}),
             MockCell({"n": 1, "ok": True, "attname": "name"}),
         ],
-        # hypopg_create_index (for users.name, orders.user_id)
-        [MockCell({"indexrelid": 1554}), MockCell({"indexrelid": 1555})],
         # hypopg_list_indexes
         [
             MockCell({"index_name": "crystaldba_idx_users_name_1", "index_size": 8000}),
@@ -545,8 +542,6 @@ async def test_basic_workload_analysis(async_sql_driver):
                 }
             ),
         ],
-        # hypopg_reset
-        [],
         # EXPLAIN without indexes
         [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 100.0}}]})],  # users.name
         [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 150.0}}]})],  # orders.user_id
@@ -564,8 +559,6 @@ async def test_basic_workload_analysis(async_sql_driver):
         # EXPLAIN with users.name and orders.user_id indexes
         [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 50.0}}]})],  # users.name
         [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 75.0}}]})],  # orders.user_id
-        # hypopg_reset (final cleanup)
-        [],
     ]
     global responses_index
     responses_index = 0
@@ -763,7 +756,7 @@ async def test_replace_parameters_fallback(create_dta):
     AND age BETWEEN $4 AND $5
     """
     result = await dta._sql_bind_params.replace_parameters(query.lower())
-    assert "status = 'active'" in result or "status = 'sample_value'" in result
+    assert "status = 'active'" in result
     assert "created_at > '2023-01-01'" in result
     assert "name like '%sample%'" in result or "name like '%" in result
     assert "between 10 and 100" in result or "between 42 and 42" in result
@@ -1334,3 +1327,69 @@ def test_max_runtime_from_env(async_sql_driver, monkeypatch):
     monkeypatch.delenv("DTA_MAX_RUNTIME_SECONDS")
     assert DatabaseTuningAdvisor(sql_driver=async_sql_driver).max_runtime_seconds == 600
     assert DatabaseTuningAdvisor(sql_driver=async_sql_driver, max_runtime_seconds=5).max_runtime_seconds == 5
+
+
+@pytest.mark.asyncio
+async def test_greedy_search_skips_failed_plan_with_zero_base_size(async_sql_driver):
+    def execute(query, *, reset_hypopg=False):
+        if "pg_total_relation_size" in query:
+            return [MockCell({"rel_size": 0})]
+        if "pg_stats" in query:
+            return [MockCell({"total_width": 4, "total_distinct": 100})]
+        if query.startswith("SELECT current_setting"):
+            return [MockCell({"postgres_version": "16.11", "hypopg_version": "1.4.2"})]
+        assert reset_hypopg
+        if "bad_column" in query:
+            raise InternalError_("could not open relation with OID 13531")
+        return [MockCell({"QUERY PLAN": [{"Plan": {"Total Cost": 12.14}}]})]
+
+    async_sql_driver.execute_query.side_effect = execute
+    advisor = DatabaseTuningAdvisor(async_sql_driver, max_runtime_seconds=0)
+    query = "SELECT * FROM diary5 WHERE good_column = 1"
+    stmt = parse_sql(query)[0].stmt
+    good = IndexRecommendation("diary5", ("good_column",))
+    bad = IndexRecommendation("diary5", ("bad_column",))
+
+    indexes, cost = await advisor._enumerate_greedy([(query, stmt, 1.0)], set(), 185.68, {bad, good})
+
+    assert indexes == {good}
+    assert cost == 12.14
+    assert advisor.cost_cache[frozenset({bad.index_definition})] == float("inf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_tables", [False, True])
+async def test_unresolved_parameter_requires_typed_value(create_dta, has_tables):
+    bind_params = create_dta._sql_bind_params
+    sql = "SELECT substr(name, $12) FROM users" if has_tables else "SELECT abs($12)"
+
+    with pytest.raises(UnresolvedBindParameterError, match=r"Cannot infer a sample value for \$12"):
+        await bind_params.replace_parameters(sql)
+
+
+@pytest.mark.asyncio
+async def test_workload_keeps_queries_with_resolved_parameters(create_dta):
+    valid_query = "SELECT * FROM users WHERE id = 1"
+    workload = [{"query": "SELECT substr(name, $1) FROM users"}, {"query": valid_query}]
+
+    result = await create_dta._validate_and_parse_workload(workload)
+
+    assert [item["query"] for item in result] == [valid_query]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("autoanalyzed", [True, False])
+async def test_dta_precheck_accepts_autoanalyze_only(create_dta, async_sql_driver, autoanalyzed):
+    stats = [MockCell({"last_analyze": None, "last_autoanalyze": "2026-11-26"})] if autoanalyzed else []
+    async_sql_driver.execute_query.side_effect = [[MockCell({"extversion": "1.4.2"})], stats]
+
+    session = IndexTuningResult(session_id="test", budget_mb=10)
+    result = await create_dta._run_prechecks(session)
+
+    stats_query = async_sql_driver.execute_query.await_args_list[1].args[0]
+    assert "last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL" in stats_query
+    if autoanalyzed:
+        assert result is None
+    else:
+        assert result is session
+        assert session.error and "No manual or automatic ANALYZE" in session.error

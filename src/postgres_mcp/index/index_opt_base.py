@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 import time
 from abc import ABC
@@ -11,6 +12,7 @@ from typing import Iterable
 
 from pglast import parse_sql
 from pglast.ast import SelectStmt
+from psycopg.errors import InternalError_
 
 from ..artifacts import calculate_improvement_multiple
 from ..explain import ExplainPlanTool
@@ -20,6 +22,7 @@ from ..sql import SqlBindParams
 from ..sql import SqlDriver
 from ..sql import TableAliasVisitor
 from ..sql import check_hypopg_installation_status
+from ..sql.bind_params import UnresolvedBindParameterError
 
 logger = logging.getLogger(__name__)
 
@@ -282,9 +285,6 @@ class IndexTuningBase(ABC):
                 recommendations: tuple[set[IndexRecommendation], float] = await self._generate_recommendations(query_weights)
                 session.recommendations = await self._format_recommendations(query_weights, recommendations)
 
-                # Reset HypoPG only once at the end
-                await self.sql_driver.execute_query("SELECT hypopg_reset();")
-
         except Exception as e:
             logger.error(f"Error in workload analysis: {e}", exc_info=True)
             session.error = f"Error in workload analysis: {e}"
@@ -311,13 +311,13 @@ class IndexTuningBase(ABC):
             session.error = hypopg_message
             return session
 
-        # Pre-check 2: Check if ANALYZE has been run at least once
-        result = await self.sql_driver.execute_query("SELECT s.last_analyze FROM pg_stat_user_tables s ORDER BY s.last_analyze LIMIT 1;")
-        if not result or not any(row.cells.get("last_analyze") is not None for row in result):
+        result = await self.sql_driver.execute_query(
+            "SELECT last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL LIMIT 1"
+        )
+        if not result:
             error_message = (
-                "Statistics are not up-to-date. The database needs to be analyzed first. "
-                "Please run 'ANALYZE;' on your database before using the tuning advisor. "
-                "Without up-to-date statistics, the index recommendations may be inaccurate."
+                "No manual or automatic ANALYZE is recorded for user tables in this database. "
+                "Run ANALYZE on the tables to be tuned before using the tuning advisor."
             )
             session.error = error_message
             logger.error(error_message)
@@ -329,6 +329,7 @@ class IndexTuningBase(ABC):
     async def _validate_and_parse_workload(self, workload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Validate the workload to ensure it is analyzable."""
         validated_workload = []
+        parameter_error = None
         for q in workload:
             query_text = q["query"]
             if not query_text:
@@ -337,7 +338,12 @@ class IndexTuningBase(ABC):
             query_text = query_text.strip()
 
             # Replace parameter placeholders with dummy values
-            query_text = await self._sql_bind_params.replace_parameters(query_text)
+            try:
+                query_text = await self._sql_bind_params.replace_parameters(query_text)
+            except UnresolvedBindParameterError as error:
+                parameter_error = error
+                self.dta_trace(f"Skipping workload query: {error}")
+                continue
 
             parsed = parse_sql(query_text)
             if not parsed:
@@ -351,6 +357,8 @@ class IndexTuningBase(ABC):
             q["query"] = query_text
             q["stmt"] = stmt
             validated_workload.append(q)
+        if not validated_workload and parameter_error is not None:
+            raise parameter_error
         return validated_workload
 
     def _covert_workload_to_query_weights(self, workload: list[dict[str, Any]]) -> list[tuple[str, SelectStmt, float]]:
@@ -488,6 +496,14 @@ class IndexTuningBase(ABC):
                     total_cost += cost * weight
                     valid_queries += 1
                 except Exception as e:
+                    if (
+                        indexes
+                        and isinstance(e, InternalError_)
+                        and re.fullmatch(r"could not open relation with OID [0-9]+", e.diag.message_primary or str(e))
+                    ):
+                        self.dta_trace(f"    + skipping configuration {candidate_str(indexes)}: {e}")
+                        self.cost_cache[indexes] = float("inf")
+                        return self.cost_cache[indexes]
                     raise ValueError(f"Error executing explain for query: {query_text}") from e
 
             if valid_queries == 0:
@@ -565,6 +581,11 @@ class IndexTuningBase(ABC):
                 frozenset([index_config.index_definition]),  # Only this index
             )
 
+            if progressive_cost == float("inf") or individual_cost == float("inf"):
+                self.dta_trace(f"Skipping recommendation with unavailable plan: {candidate_str([index_config])}")
+                indexes_so_far.pop()
+                continue
+
             size = await self._estimate_index_size(index_config.table, list(index_config.columns))
             if budget_bytes < 0 or total_size + size <= budget_bytes:
                 self.dta_trace(f"Adding index: {candidate_str([index_config])}")
@@ -587,6 +608,7 @@ class IndexTuningBase(ABC):
                 recommendations.append(rec)
                 total_size += size
             else:
+                indexes_so_far.pop()
                 self.dta_trace(f"Skipping index: {candidate_str([index_config])} because it exceeds budget")
 
         return recommendations

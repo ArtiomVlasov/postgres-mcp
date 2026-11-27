@@ -275,6 +275,13 @@ class ColumnCollector(Visitor):
                 self(node.node)
 
 
+class UnresolvedBindParameterError(ValueError):
+    """No suitable value could be inferred for a bind parameter."""
+
+    def __init__(self, parameter: str):
+        super().__init__(f"Cannot infer a sample value for {parameter}. Replace it with a SQL literal of the correct type.")
+
+
 class SqlBindParams:
     """
     Replaces parameter placeholders with appropriate values based on column statistics.
@@ -371,7 +378,11 @@ class SqlBindParams:
 
             table_columns = self.extract_columns(query)
             if not table_columns:
-                return self._replace_parameters_generic(modified_query)
+                modified_query = self._replace_parameters_generic(modified_query)
+                unresolved = re.search(r"\$\d+", modified_query)
+                if unresolved:
+                    raise UnresolvedBindParameterError(unresolved.group())
+                return modified_query
 
             # Process each remaining parameter
             for match in reversed(param_matches):
@@ -390,7 +401,7 @@ class SqlBindParams:
                 if clause_start == -1:
                     clause_start = max(0, param_position - 100)
 
-                preceding_text = modified_query[clause_start : param_position + 2]
+                preceding_text = modified_query[clause_start : match.end()]
 
                 # Try to identify which column this parameter belongs to
                 column_info = self._identify_parameter_column(preceding_text, table_columns)
@@ -404,9 +415,13 @@ class SqlBindParams:
                 else:
                     replacement = self._get_generic_replacement(preceding_text)
 
+                if replacement is None:
+                    raise UnresolvedBindParameterError(match.group())
                 modified_query = modified_query[: match.start()] + replacement + modified_query[match.end() :]
 
             return modified_query
+        except UnresolvedBindParameterError:
+            raise
         except Exception as e:
             raise ValueError("Error replacing parameters") from e
 
@@ -627,7 +642,7 @@ class SqlBindParams:
             # Return as string if not a number
             return value
 
-    def _get_replacement_value(self, stats: dict[str, Any], context: str) -> str:
+    def _get_replacement_value(self, stats: dict[str, Any], context: str) -> str | None:
         """Generate an appropriate replacement value based on column statistics."""
         data_type = stats.get("data_type", "").lower()
         common_vals = stats.get("common_vals")
@@ -696,10 +711,9 @@ class SqlBindParams:
         elif data_type == "boolean":
             return "true"
 
-        # Default fallback
-        return "'sample_value'"
+        return None
 
-    def _get_generic_replacement(self, context: str) -> str:
+    def _get_generic_replacement(self, context: str) -> str | None:
         """Provide a generic replacement when we can't determine the specific column type."""
         context = context.lower()
 
@@ -720,8 +734,7 @@ class SqlBindParams:
         if any(op in context for op in ["=", ">", "<", ">=", "<="]):
             return "44"
 
-        # Default to string
-        return "'sample_value'"
+        return None
 
     def _replace_parameters_generic(self, query: str) -> str:
         """Fallback generic parameter replacement when catalog lookup fails."""
@@ -755,9 +768,6 @@ class SqlBindParams:
             modified_query = re.sub(r"<\s*\$\d+", "< 100", modified_query)
             modified_query = re.sub(r"=\s*\$\d+\b", "= 45", modified_query)
 
-            # For any remaining parameters, use a generic replacement
-            modified_query = re.sub(r"\$\d+", "'sample_value'", modified_query)
-
             return modified_query
         except Exception as e:
             logger.error(f"Error in generic parameter replacement: {e}", exc_info=True)
@@ -783,8 +793,7 @@ class SqlBindParams:
         if "status" in col_name or "type" in col_name or "state" in col_name:
             return f"{col_name} {op} 'active'"
 
-        # Default to string for other columns
-        return f"{col_name} {op} 'sample_value'"
+        return match.group()
 
     def extract_columns(self, query: str) -> dict[str, set[str]]:
         """Extract columns from a query using improved visitors."""

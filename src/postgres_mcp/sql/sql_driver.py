@@ -10,6 +10,8 @@ from typing import Optional
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
+from psycopg import Error
+from psycopg import OperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
@@ -184,6 +186,8 @@ class SqlDriver:
         query: LiteralString,
         params: list[Any] | None = None,
         force_readonly: bool = False,
+        *,
+        reset_hypopg: bool = False,
     ) -> Optional[List[RowResult]]:
         """
         Execute a query and return results.
@@ -192,6 +196,7 @@ class SqlDriver:
             query: SQL query to execute
             params: Query parameters
             force_readonly: Whether to enforce read-only mode
+            reset_hypopg: Clear session-local hypothetical indexes before releasing the connection
 
         Returns:
             List of RowResult objects or None on error
@@ -202,16 +207,22 @@ class SqlDriver:
                 if self.conn is None:
                     raise ValueError("Connection not established")
 
+            options = {"reset_hypopg": True} if reset_hypopg else {}
+
             # Handle connection pool vs direct connection
             if self.is_pool:
                 # For pools, get a connection from the pool
                 pool = await self.conn.pool_connect()
                 async with pool.connection() as connection:
-                    return await self._execute_with_connection(connection, query, params, force_readonly=force_readonly)
+                    return await self._execute_with_connection(connection, query, params, force_readonly=force_readonly, **options)
             else:
                 # Direct connection approach
-                return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
+                return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly, **options)
         except Exception as e:
+            # PostgreSQL statement errors leave the connection usable after rollback.
+            if isinstance(e, Error) and not isinstance(e, OperationalError):
+                raise
+
             # Mark pool as invalid if there was a connection issue
             if self.conn and self.is_pool:
                 self.conn._is_valid = False  # type: ignore
@@ -219,9 +230,9 @@ class SqlDriver:
             elif self.conn and not self.is_pool:
                 self.conn = None
 
-            raise e
+            raise
 
-    async def _execute_with_connection(self, connection, query, params, force_readonly) -> Optional[List[RowResult]]:
+    async def _execute_with_connection(self, connection, query, params, force_readonly, *, reset_hypopg=False) -> Optional[List[RowResult]]:
         """Execute query with the given connection."""
         transaction_started = False
         try:
@@ -233,6 +244,9 @@ class SqlDriver:
 
                 if params:
                     await cursor.execute(query, params)
+                elif "GENERIC_PLAN" in query.upper() and re.search(r"\$[0-9]+", query):
+                    # GENERIC_PLAN interprets $n in the explained SQL on the server.
+                    await cursor.execute(query, prepare=False)
                 else:
                     await cursor.execute(query)
 
@@ -262,11 +276,23 @@ class SqlDriver:
 
         except Exception as e:
             # Try to roll back the transaction if it's still active
-            if transaction_started:
+            if not reset_hypopg:
                 try:
                     await connection.rollback()
                 except Exception as rollback_error:
                     logger.error(f"Error rolling back transaction: {rollback_error}")
 
             logger.error(f"Error executing query ({query}): {e}")
-            raise e
+            raise
+
+        finally:
+            if reset_hypopg:
+                # HypoPG state survives rollback and belongs to this backend.
+                try:
+                    await connection.rollback()
+                    async with connection.cursor() as cursor:
+                        await cursor.execute("SELECT hypopg_reset()")
+                    await connection.commit()
+                except BaseException:
+                    await connection.close()
+                    raise

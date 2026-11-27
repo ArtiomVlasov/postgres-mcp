@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 from itertools import combinations
@@ -173,16 +174,13 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         self.dta_trace(f"Filtered to {len(condition_filtered)} after removing long text columns and unknown tables/columns.")
         # Batch create all hypothetical indexes and store their size estimates
         if len(condition_filtered) > 0:
-            query = "SELECT hypopg_create_index({});" * len(condition_filtered)
-            await SafeSqlDriver.execute_param_query(
-                self.sql_driver,
-                query,
+            create_indexes = SafeSqlDriver.param_sql_to_query(
+                "SELECT hypopg_create_index({});" * len(condition_filtered),
                 [idx.definition for idx in condition_filtered],
             )
-
-            # Get estimated sizes without resetting indexes yet
             result = await self.sql_driver.execute_query(
-                "SELECT index_name, hypopg_relation_size(indexrelid) as index_size FROM hypopg_list_indexes;"
+                f"SELECT hypopg_reset();{create_indexes}SELECT index_name, hypopg_relation_size(indexrelid) as index_size FROM hypopg_list_indexes;",  # type: ignore
+                reset_hypopg=True,
             )
             if result is not None:
                 index_map = {r.cells["index_name"]: r.cells["index_size"] for r in result}
@@ -190,7 +188,6 @@ class DatabaseTuningAdvisor(IndexTuningBase):
                     if idx.name in index_map:
                         idx.estimated_size_bytes = index_map[idx.name]
 
-            await self.sql_driver.execute_query("SELECT hypopg_reset();")
         return condition_filtered
 
     async def _enumerate_greedy(
@@ -208,8 +205,6 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         - We want to minimize this function, with alpha=2 for 2x emphasis on performance
         - Primary stopping criterion: minimum relative time improvement threshold
         """
-        import math
-
         # Parameters
         alpha = self.pareto_alpha
         min_time_improvement = self.min_time_improvement  # 5% default
@@ -234,7 +229,7 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         # Total space is base relation plus indexes
         current_space = base_relation_size + indexes_size
         current_time = current_cost
-        current_objective = math.log(current_time) + alpha * math.log(current_space) if current_cost > 0 and current_space > 0 else float("inf")
+        current_objective = math.log(current_time) + alpha * math.log(current_space) if current_time > 0 and current_space > 0 else math.inf
 
         self.dta_trace(
             f"  - Initial configuration: Time={current_time:.2f}, "
@@ -246,7 +241,7 @@ class DatabaseTuningAdvisor(IndexTuningBase):
         added_indexes = []  # Keep track of added indexes in order
         iteration = 1
 
-        while True:
+        while current_time > 0 and math.isfinite(current_time):
             self.dta_trace(f"\n[ITERATION {iteration}] Evaluating candidates")
             best_index = None
             best_time = current_time
@@ -275,6 +270,8 @@ class DatabaseTuningAdvisor(IndexTuningBase):
                 # Calculate new time (cost) with this index
                 test_time = await self._evaluate_configuration_cost(queries, frozenset(idx.index_definition for idx in current_indexes | {candidate}))
                 self.dta_trace(f"    + Eval cost (time): {test_time}")
+                if not math.isfinite(test_time):
+                    continue
 
                 # Calculate relative time improvement
                 time_improvement = (current_time - test_time) / current_time
@@ -285,7 +282,7 @@ class DatabaseTuningAdvisor(IndexTuningBase):
                     continue
 
                 # Calculate objective for this configuration
-                test_objective = math.log(test_time) + alpha * math.log(test_space)
+                test_objective = math.log(test_time) + alpha * math.log(max(1, test_space)) if test_time > 0 else -math.inf
 
                 # Select the index with the best time improvement that meets our threshold
                 if test_objective < best_objective and time_improvement > best_time_improvement:
@@ -305,14 +302,15 @@ class DatabaseTuningAdvisor(IndexTuningBase):
 
             # Calculate improvements/changes
             time_improvement = (current_time - best_time) / current_time
-            space_increase = (best_space - current_space) / current_space
+            space_delta = best_space - current_space
+            space_increase = f"{space_delta / current_space:.2%}" if current_space else humanize.naturalsize(space_delta)
             objective_improvement = current_objective - best_objective
 
             # Log this step
             self.dta_trace(
                 f"  - Selected index: {candidate_str([best_index])}"
                 f"\n    + Time improvement: {time_improvement:.2%}"
-                f"\n    + Space increase: {space_increase:.2%}"
+                f"\n    + Space increase: {space_increase}"
                 f"\n    + New objective: {best_objective:.4f} (improvement: {objective_improvement:.4f})"
             )
 
