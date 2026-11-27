@@ -7,6 +7,8 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 
+from psycopg import Error
+
 from ..artifacts import ErrorResult
 from ..artifacts import ExplainPlanArtifact
 from ..sql import IndexDefinition
@@ -217,7 +219,7 @@ class ExplainPlanTool:
                 explain_options.append("COSTS TRUE")
 
             explain_plan_query = f"{create_indexes_query}EXPLAIN ({', '.join(explain_options)}) {query_text}"
-            plan_result = await self.sql_driver.execute_query(explain_plan_query)  # type: ignore
+            plan_result = await self.sql_driver.execute_query(explain_plan_query, reset_hypopg=True)  # type: ignore
 
             # Extract the plan
             if plan_result and plan_result[0].cells.get("QUERY PLAN"):
@@ -234,8 +236,28 @@ class ExplainPlanTool:
             return {"Plan": {"Total Cost": float("inf")}}
 
         except Exception as e:
+            if isinstance(e, Error):
+                logger.warning(
+                    "HypoPG planning error: SQLSTATE=%s DETAIL=%s HINT=%s CONTEXT=%s LOCATION=%s:%s (%s)",
+                    e.sqlstate,
+                    e.diag.message_detail,
+                    e.diag.message_hint,
+                    e.diag.context,
+                    e.diag.source_file,
+                    e.diag.source_line,
+                    e.diag.source_function,
+                )
+                try:
+                    versions = await self.sql_driver.execute_query(
+                        "SELECT current_setting('server_version') AS postgres_version, extversion AS hypopg_version "
+                        "FROM pg_extension WHERE extname = 'hypopg'"
+                    )
+                    if versions:
+                        logger.warning("HypoPG planning environment: %s", versions[0].cells)
+                except Exception:
+                    logger.warning("Could not read PostgreSQL and HypoPG versions", exc_info=True)
             logger.error(
                 f"Error getting explain plan for query: {query_text} with error: {e}",
                 exc_info=True,
             )
-            raise e
+            raise

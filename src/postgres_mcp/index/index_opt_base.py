@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 import time
 from abc import ABC
@@ -11,6 +12,7 @@ from typing import Iterable
 
 from pglast import parse_sql
 from pglast.ast import SelectStmt
+from psycopg.errors import InternalError_
 
 from ..artifacts import calculate_improvement_multiple
 from ..explain import ExplainPlanTool
@@ -282,9 +284,6 @@ class IndexTuningBase(ABC):
                 recommendations: tuple[set[IndexRecommendation], float] = await self._generate_recommendations(query_weights)
                 session.recommendations = await self._format_recommendations(query_weights, recommendations)
 
-                # Reset HypoPG only once at the end
-                await self.sql_driver.execute_query("SELECT hypopg_reset();")
-
         except Exception as e:
             logger.error(f"Error in workload analysis: {e}", exc_info=True)
             session.error = f"Error in workload analysis: {e}"
@@ -488,6 +487,14 @@ class IndexTuningBase(ABC):
                     total_cost += cost * weight
                     valid_queries += 1
                 except Exception as e:
+                    if (
+                        indexes
+                        and isinstance(e, InternalError_)
+                        and re.fullmatch(r"could not open relation with OID [0-9]+", e.diag.message_primary or str(e))
+                    ):
+                        self.dta_trace(f"    + skipping configuration {candidate_str(indexes)}: {e}")
+                        self.cost_cache[indexes] = float("inf")
+                        return self.cost_cache[indexes]
                     raise ValueError(f"Error executing explain for query: {query_text}") from e
 
             if valid_queries == 0:
@@ -565,6 +572,11 @@ class IndexTuningBase(ABC):
                 frozenset([index_config.index_definition]),  # Only this index
             )
 
+            if progressive_cost == float("inf") or individual_cost == float("inf"):
+                self.dta_trace(f"Skipping recommendation with unavailable plan: {candidate_str([index_config])}")
+                indexes_so_far.pop()
+                continue
+
             size = await self._estimate_index_size(index_config.table, list(index_config.columns))
             if budget_bytes < 0 or total_size + size <= budget_bytes:
                 self.dta_trace(f"Adding index: {candidate_str([index_config])}")
@@ -587,6 +599,7 @@ class IndexTuningBase(ABC):
                 recommendations.append(rec)
                 total_size += size
             else:
+                indexes_so_far.pop()
                 self.dta_trace(f"Skipping index: {candidate_str([index_config])} because it exceeds budget")
 
         return recommendations

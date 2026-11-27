@@ -5,6 +5,7 @@ from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
+from psycopg.errors import InternalError_
 
 from postgres_mcp.sql import DbConnPool
 from postgres_mcp.sql import SqlDriver
@@ -365,3 +366,43 @@ async def test_engine_url_connection():
         # Verify driver state
         assert driver.is_pool is True
         assert driver.conn is not None
+
+
+@pytest.fixture
+def executing_connection():
+    connection = MagicMock()
+    connection.rollback = AsyncMock()
+    connection.commit = AsyncMock()
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchall = AsyncMock(return_value=[])
+    cursor.nextset.return_value = None
+    connection.cursor.return_value.__aenter__.return_value = cursor
+    return connection, cursor
+
+
+@pytest.mark.asyncio
+async def test_generic_plan_with_bind_variables_disables_preparation(executing_connection):
+    connection, cursor = executing_connection
+    query = "EXPLAIN (FORMAT JSON, GENERIC_PLAN) SELECT 1 WHERE 1 = $1"
+
+    await SqlDriver(conn=connection).execute_query(query)
+
+    cursor.execute.assert_any_await(query, prepare=False)
+
+
+@pytest.mark.asyncio
+async def test_hypopg_cleanup_runs_after_query_error_on_same_connection(executing_connection):
+    connection, cursor = executing_connection
+    error = InternalError_("could not open relation with OID 13531")
+    cursor.execute.side_effect = [error, None]
+    driver = SqlDriver(conn=connection)
+
+    with pytest.raises(InternalError_) as failure:
+        await driver.execute_query("EXPLAIN SELECT 1", reset_hypopg=True)
+
+    assert failure.value is error
+    assert driver.conn is connection
+    connection.rollback.assert_awaited_once()
+    assert cursor.execute.await_args_list == [call("EXPLAIN SELECT 1"), call("SELECT hypopg_reset()")]
+    connection.commit.assert_awaited_once()

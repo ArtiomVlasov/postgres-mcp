@@ -431,7 +431,8 @@ async def test_explain_with_functional_hypothetical_indexes(mock_sql_driver):
     }
 
     # Mock the hypopg_reset and hypopg_create_index calls
-    def side_effect(query):
+    def side_effect(query, *, reset_hypopg=False):
+        assert reset_hypopg
         if "hypopg_" in query or "EXPLAIN" in query:
             return [MockCell({"QUERY PLAN": [plan_data]})]
         return None
