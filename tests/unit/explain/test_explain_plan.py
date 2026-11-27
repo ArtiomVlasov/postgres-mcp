@@ -476,3 +476,14 @@ async def test_explain_with_functional_hypothetical_indexes(mock_sql_driver):
     assert "LOWER(primary_title)" in explain_call
     assert "LOWER(original_title)" in explain_call
     assert "start_year DESC" in explain_call
+
+
+@pytest.mark.asyncio
+async def test_explain_does_not_send_unresolved_parameter_to_postgres(mock_sql_driver):
+    mock_sql_driver.execute_query.return_value = [MockCell({"server_version": "15.4"})]
+
+    result = await ExplainPlanTool(mock_sql_driver).explain("SELECT abs($1)")
+
+    assert isinstance(result, ErrorResult)
+    assert "Cannot infer a sample value for $1" in result.value
+    mock_sql_driver.execute_query.assert_awaited_once_with("SHOW server_version")

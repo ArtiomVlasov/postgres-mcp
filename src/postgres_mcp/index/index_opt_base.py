@@ -22,6 +22,7 @@ from ..sql import SqlBindParams
 from ..sql import SqlDriver
 from ..sql import TableAliasVisitor
 from ..sql import check_hypopg_installation_status
+from ..sql.bind_params import UnresolvedBindParameterError
 
 logger = logging.getLogger(__name__)
 
@@ -310,13 +311,13 @@ class IndexTuningBase(ABC):
             session.error = hypopg_message
             return session
 
-        # Pre-check 2: Check if ANALYZE has been run at least once
-        result = await self.sql_driver.execute_query("SELECT s.last_analyze FROM pg_stat_user_tables s ORDER BY s.last_analyze LIMIT 1;")
-        if not result or not any(row.cells.get("last_analyze") is not None for row in result):
+        result = await self.sql_driver.execute_query(
+            "SELECT last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL LIMIT 1"
+        )
+        if not result:
             error_message = (
-                "Statistics are not up-to-date. The database needs to be analyzed first. "
-                "Please run 'ANALYZE;' on your database before using the tuning advisor. "
-                "Without up-to-date statistics, the index recommendations may be inaccurate."
+                "No manual or automatic ANALYZE is recorded for user tables in this database. "
+                "Run ANALYZE on the tables to be tuned before using the tuning advisor."
             )
             session.error = error_message
             logger.error(error_message)
@@ -328,6 +329,7 @@ class IndexTuningBase(ABC):
     async def _validate_and_parse_workload(self, workload: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Validate the workload to ensure it is analyzable."""
         validated_workload = []
+        parameter_error = None
         for q in workload:
             query_text = q["query"]
             if not query_text:
@@ -336,7 +338,12 @@ class IndexTuningBase(ABC):
             query_text = query_text.strip()
 
             # Replace parameter placeholders with dummy values
-            query_text = await self._sql_bind_params.replace_parameters(query_text)
+            try:
+                query_text = await self._sql_bind_params.replace_parameters(query_text)
+            except UnresolvedBindParameterError as error:
+                parameter_error = error
+                self.dta_trace(f"Skipping workload query: {error}")
+                continue
 
             parsed = parse_sql(query_text)
             if not parsed:
@@ -350,6 +357,8 @@ class IndexTuningBase(ABC):
             q["query"] = query_text
             q["stmt"] = stmt
             validated_workload.append(q)
+        if not validated_workload and parameter_error is not None:
+            raise parameter_error
         return validated_workload
 
     def _covert_workload_to_query_weights(self, workload: list[dict[str, Any]]) -> list[tuple[str, SelectStmt, float]]:

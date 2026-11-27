@@ -15,6 +15,7 @@ from ..sql import IndexDefinition
 from ..sql import SafeSqlDriver
 from ..sql import SqlBindParams
 from ..sql import check_postgres_version_requirement
+from ..sql.bind_params import UnresolvedBindParameterError
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,10 @@ class ExplainPlanTool:
         Returns:
             ExplainPlanArtifact or ErrorResult
         """
-        modified_sql_query, use_generic_plan = await self.replace_query_parameters_if_needed(sql_query)
+        try:
+            modified_sql_query, use_generic_plan = await self.replace_query_parameters_if_needed(sql_query)
+        except UnresolvedBindParameterError as error:
+            return ErrorResult(str(error))
         return await self._run_explain_query(modified_sql_query, analyze=do_analyze, generic_plan=use_generic_plan)
 
     async def explain_analyze(self, sql_query: str) -> ExplainPlanArtifact | ErrorResult:

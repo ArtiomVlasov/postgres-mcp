@@ -18,7 +18,9 @@ from postgres_mcp.index.dta_calc import ColumnCollector
 from postgres_mcp.index.dta_calc import ConditionColumnCollector
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 from postgres_mcp.index.dta_calc import IndexRecommendation
+from postgres_mcp.index.index_opt_base import IndexTuningResult
 from postgres_mcp.sql import IndexDefinition
+from postgres_mcp.sql.bind_params import UnresolvedBindParameterError
 
 logger = getLogger(__name__)
 
@@ -754,7 +756,7 @@ async def test_replace_parameters_fallback(create_dta):
     AND age BETWEEN $4 AND $5
     """
     result = await dta._sql_bind_params.replace_parameters(query.lower())
-    assert "status = 'active'" in result or "status = 'sample_value'" in result
+    assert "status = 'active'" in result
     assert "created_at > '2023-01-01'" in result
     assert "name like '%sample%'" in result or "name like '%" in result
     assert "between 10 and 100" in result or "between 42 and 42" in result
@@ -1353,3 +1355,41 @@ async def test_greedy_search_skips_failed_plan_with_zero_base_size(async_sql_dri
     assert indexes == {good}
     assert cost == 12.14
     assert advisor.cost_cache[frozenset({bad.index_definition})] == float("inf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_tables", [False, True])
+async def test_unresolved_parameter_requires_typed_value(create_dta, has_tables):
+    bind_params = create_dta._sql_bind_params
+    sql = "SELECT substr(name, $12) FROM users" if has_tables else "SELECT abs($12)"
+
+    with pytest.raises(UnresolvedBindParameterError, match=r"Cannot infer a sample value for \$12"):
+        await bind_params.replace_parameters(sql)
+
+
+@pytest.mark.asyncio
+async def test_workload_keeps_queries_with_resolved_parameters(create_dta):
+    valid_query = "SELECT * FROM users WHERE id = 1"
+    workload = [{"query": "SELECT substr(name, $1) FROM users"}, {"query": valid_query}]
+
+    result = await create_dta._validate_and_parse_workload(workload)
+
+    assert [item["query"] for item in result] == [valid_query]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("autoanalyzed", [True, False])
+async def test_dta_precheck_accepts_autoanalyze_only(create_dta, async_sql_driver, autoanalyzed):
+    stats = [MockCell({"last_analyze": None, "last_autoanalyze": "2026-11-26"})] if autoanalyzed else []
+    async_sql_driver.execute_query.side_effect = [[MockCell({"extversion": "1.4.2"})], stats]
+
+    session = IndexTuningResult(session_id="test", budget_mb=10)
+    result = await create_dta._run_prechecks(session)
+
+    stats_query = async_sql_driver.execute_query.await_args_list[1].args[0]
+    assert "last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL" in stats_query
+    if autoanalyzed:
+        assert result is None
+    else:
+        assert result is session
+        assert session.error and "No manual or automatic ANALYZE" in session.error
